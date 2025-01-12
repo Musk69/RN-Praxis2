@@ -1,392 +1,365 @@
+#include <arpa/inet.h>
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <regex.h>
-#include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-const int LINES = 40;
-const int BUF_MAXLEN = 8193;
-const int QUEUE = 10;
-const int MAX_CONTENT = 100;
-int is_package = 0; // 0 bedeutet package ist kein payload, alles andere ist content length of prev packages payload
-int saved_where = -1;
+#include "data.h"
+#include "http.h"
+#include "util.h"
 
-struct file {
-    int used; // 0 falls leer, 1 falls inhalt
-    char *pfad;
-    char *inhalt;
-    int con_len;
-};
+#define MAX_RESOURCES 100
 
-struct file speicher[100];
+struct tuple resources[MAX_RESOURCES] = {
+    {"/static/foo", "Foo", sizeof "Foo" - 1},
+    {"/static/bar", "Bar", sizeof "Bar" - 1},
+    {"/static/baz", "Baz", sizeof "Baz" - 1}};
 
-void init_speicher(){
-    for(int i = 0; i < MAX_CONTENT; i++){
-        speicher[i].used = 0;
-    }
-    // fill files foo, bar and baz
-    /*speicher[0].used = 1;
-    speicher[0].pfad = "/static/foo";
-    speicher[0].inhalt = "Foo";
+/**
+ * Sends an HTTP reply to the client based on the received request.
+ *
+ * @param conn      The file descriptor of the client connection socket.
+ * @param request   A pointer to the struct containing the parsed request
+ * information.
+ */
+void send_reply(int conn, struct request *request) {
 
-    speicher[1].used = 1;
-    speicher[1].pfad = "/static/bar";
-    speicher[1].inhalt = "Bar";
+    // Create a buffer to hold the HTTP reply
+    char buffer[HTTP_MAX_SIZE];
+    char *reply = buffer;
+    size_t offset = 0;
 
-    speicher[2].used = 1;
-    speicher[2].pfad = "/static/foo";
-    speicher[2].inhalt = "Baz";*/
-}
+    fprintf(stderr, "Handling %s request for %s (%lu byte payload)\n",
+            request->method, request->uri, request->payload_length);
 
-void error(char *msg) {
-    perror(msg);
-    exit(1);
-}
+    if (strcmp(request->method, "GET") == 0) {
+        // Find the resource with the given URI in the 'resources' array.
+        size_t resource_length;
+        const char *resource =
+            get(request->uri, resources, MAX_RESOURCES, &resource_length);
 
-void free_lines(int ctr, char *lines[]){
-    for(int i = 0; i < ctr-1; i++){
-        free(lines[i]);
-    }
-}
-
-char *build_resp(int i){
-    char *response = malloc(300);
-    if(response==NULL) {error("malloc failed");}
-    memset(response, 0, 100);
-
-    strncpy(response, "HTTP/1.1 200\r\nContent-Length: ", strlen("HTTP/1.1 200\r\nContent-Length: "));
-    char num[5];
-    memset(num, 0, 5);
-    sprintf(num, "%d", speicher[i].con_len);
-    strcat(response, num);
-    strcat(response, "\r\n\r\n");
-    strcat(response, speicher[i].inhalt);
-    strcat(response, "\r\n\r\n");
-
-    return (response);
-}
-
-int find(char *request) {
-    for(int i = 0; i < MAX_CONTENT; i++) {
-        // falls file inhalt hat, vergleiche pfade
-        if (speicher[i].used == 1) {
-            // falls pfad mit request übereinstimmt, gebe i zurück
-            if (strncmp(request, speicher[i].pfad, strlen(speicher[i].pfad)) == 0) {
-                return i;
-            }
+        if (resource) {
+            size_t payload_offset =
+                sprintf(reply, "HTTP/1.1 200 OK\r\nContent-Length: %lu\r\n\r\n",
+                        resource_length);
+            memcpy(reply + payload_offset, resource, resource_length);
+            offset = payload_offset + resource_length;
+        } else {
+            reply = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+            offset = strlen(reply);
         }
-    }
-    // pfad nicht gefunden
-    return -1;
-}
-
-int find_empty(){
-    for(int i = 0; i < MAX_CONTENT; i++) {
-        // falls file inhalt hat, vergleiche pfade
-        if (speicher[i].used == 0) {
-            return i;
+    } else if (strcmp(request->method, "PUT") == 0) {
+        // Try to set the requested resource with the given payload in the
+        // 'resources' array.
+        if (set(request->uri, request->payload, request->payload_length,
+                resources, MAX_RESOURCES)) {
+            reply = "HTTP/1.1 204 No Content\r\n\r\n";
+        } else {
+            reply = "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n";
         }
-    }
-    return -1;
-}
-
-void do_payload(char *payload){
-    if(saved_where == -1) {
-        return;
-    }
-    // save payload
-    speicher[saved_where].inhalt = payload;
-}
-
-char *get_req(char *request){
-    int len = strlen("/static/foo");
-    if(strlen(request) > len) { len = (int)strlen(request); } // zu vergleichende anzahl zeichen auf den längeren beider strings setzen
-
-    //GET /static/foo Anfrage
-    if(strncmp(request, "/static/foo", len) == 0) {
-        return("HTTP/1.1 200\r\nContent-Length: 3\r\n\r\nFoo\r\n\r\n");
-    }
-    //GET /static/bar Anfrage
-    if(strncmp(request, "/static/bar", len) == 0) {
-        return("HTTP/1.1 200\r\nContent-Length: 3\r\n\r\nBar\r\n\r\n");
-    }
-    //GET /static/baz Anfrage
-    if(strncmp(request, "/static/baz", len) == 0) {
-        return("HTTP/1.1 200\r\nContent-Length: 3\r\n\r\nBaz\r\n\r\n");
-    }
-
-    int c = find(request);
-    if(c >= 0) {
-        return(build_resp(c));
-    }
-    //alle anderen GET Anfragen
-    return("HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n");
-}
-
-
-char *parse_packet(char *buffer){
-    char *crlf = "\r\n";                                //separating argument
-    int len_crlf = (int)strlen(crlf);
-
-    char *packet = buffer;
-
-    char *lines[LINES];
-    int ctr = 0;
-
-    // heraussuchen aller mit crlf voneinander getrennten strings
-    while(1){
-        char *res = strstr(packet, crlf);   // erstes vorkommen von crlf in packet finden
-        if(res == NULL){ break; }                          // while-schleife beenden, falls kein crlf (mehr)
-        char *new_packet = res + len_crlf;                 // neuer zu parsender string (pointer aktualisieren, sodass vorherige line ausgeschlossen ist)
-
-        char *sentence = (char *)malloc(strlen(packet) - strlen(new_packet));
-        if(sentence == NULL){error("malloc failed.");}
-        strncpy(sentence, packet, (strlen(packet) - strlen(new_packet))); // die zeile
-        lines[ctr] = sentence;                             // put sentence in array of lines
-        ctr++;
-        packet = new_packet;                               // update packet
-    }
-
-    // überprüfe ob Anfrage vollständig ist
-    if(ctr < 1) { free_lines(ctr, lines); return(NULL); } // falls kein crlf existiert
-    if(strncmp(lines[0], crlf, len_crlf) == 0) { free_lines(ctr, lines); return(NULL); } //falls in der 1. Zeile kein inhalt oder nur crlf ist
-
-    // content length default is 0
-    int content_length = 0;
-    // falls mehr als ein header existiert scanne for content length header and update content length
-    if(ctr > 1){
-        for(int i = 1; i < ctr; i++){ // zeilen kontrollieren
-            if(strncmp(lines[i], "Content-Length:", 15) == 0){
-                char str[16];
-                sscanf(lines[i], "%[^ ] %d", str, &content_length);
-            }
+        offset = strlen(reply);
+    } else if (strcmp(request->method, "DELETE") == 0) {
+        // Try to delete the requested resource from the 'resources' array
+        if (delete (request->uri, resources, MAX_RESOURCES)) {
+            reply = "HTTP/1.1 204 No Content\r\n\r\n";
+        } else {
+            reply = "HTTP/1.1 404 Not Found\r\n\r\n";
         }
-    }
-    is_package = content_length;
-
-    char head[strlen(lines[0])];
-    memset(head, 0, strlen(lines[0]));
-    strncpy(head, lines[0], strlen(lines[0])-len_crlf); // das crlf am ende der line ist unerwünscht und wird rausgeschnitten
-    free_lines(ctr, lines);
-
-    regex_t header;
-    regmatch_t pmatch[4]; // We have 3 capturing groups + the whole match group
-    size_t nmatch = 4; // Same as above
-
-    char reg_header[] = "^([A-Z]+) (.*/.*) (HTTP/[0-9][.][0-9])"; // pattern for first header
-
-    int sol = regcomp(&header, reg_header, REG_EXTENDED); //compile regular expression
-    if(sol != 0){ error("error in regcomp"); }
-
-    int match = regexec(&header, head, nmatch, pmatch, 0); //compare buffer to regular expression
-    nmatch = header.re_nsub;
-    regfree(&header);
-
-    // correct request
-    if(match == 0) {
-        //parse method
-        char method[pmatch[1].rm_eo];
-        memset(method, 0, pmatch[1].rm_eo +1);
-        strncpy(method, head, pmatch[1].rm_eo);
-
-        // if method = GET
-        if((strncmp(method, "GET", 3)) == 0) {
-            //parse URI
-            int l = pmatch[2].rm_eo - (pmatch[1].rm_eo +1); //len URI ist offset des 2. segments - offset des 1. segments - leerzeichen
-            char req[l];
-            memset(req, 0, l+1);
-            strncpy(req, head+pmatch[2].rm_so, l);
-
-            char *mesg = get_req(req);
-            return(mesg);
-        }
-        // if method = PUT
-        else if((strncmp(method, "PUT", 3)) == 0) {
-            //parse URI
-            int l = pmatch[2].rm_eo - (pmatch[1].rm_eo +1); //len URI ist offset des 2. segments - offset des 1. segments - leerzeichen
-            char req[l];
-            memset(req, 0, l+1);
-            strncpy(req, head+pmatch[2].rm_so, l);
-
-            if(strncmp(req, "/dynamic/", strlen("/dynamic/")) != 0){
-                return("HTTP/1.1 403\r\nContent-Length: 0\r\n\r\n");
-            }
-
-            int c = find(req);
-            if(c >= 0){
-                speicher[c].con_len = content_length;
-                speicher[c].pfad = req;
-                saved_where = c;
-                return ("HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n");
-            }
-            int nc = find_empty();
-            if(nc < 0) { error("speicher voll"); }
-            speicher[nc].con_len = content_length;
-            speicher[nc].pfad = req;
-            speicher[nc].used = 1;
-            saved_where = nc;
-            return("HTTP/1.1 201\r\nContent-Length: 0\r\n\r\n");
-        }
-        // if method = DELETE
-        else if((strncmp(method, "DELETE", 6)) == 0){
-            //parse URI
-            int l = pmatch[2].rm_eo - (pmatch[1].rm_eo +1); //len URI ist offset des 2. segments - offset des 1. segments - leerzeichen
-            char req[l];
-            memset(req, 0, l+1);
-            strncpy(req, head+pmatch[2].rm_so, l);
-
-            int c = find(req);
-            if(c >= 0) {
-                speicher[c].inhalt = 0;
-                return ("HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n");
-            }
-            return ("HTTP/1.1 404\r\nContent-Length: 0\r\n\r\n");
-        }
-        // other method
-        else {
-            return("HTTP/1.1 501\r\nContent-Length: 0\r\n\r\n");
-        }
+        offset = strlen(reply);
+    } else {
+        reply = "HTTP/1.1 501 Method Not Supported\r\n\r\n";
+        offset = strlen(reply);
     }
 
-    // incorrect request
-    else {
-        return("HTTP/1.1 400\r\nContent-Length: 0\r\n\r\n");
+    // Send the reply back to the client
+    if (send(conn, reply, offset, 0) == -1) {
+        perror("send");
+        close(conn);
     }
 }
 
-int main(int argc, char *argv[]) {
+/**
+ * Processes an incoming packet from the client.
+ *
+ * @param conn The socket descriptor representing the connection to the client.
+ * @param buffer A pointer to the incoming packet's buffer.
+ * @param n The size of the incoming packet.
+ *
+ * @return Returns the number of bytes processed from the packet.
+ *         If the packet is successfully processed and a reply is sent, the
+ * return value indicates the number of bytes processed. If the packet is
+ * malformed or an error occurs during processing, the return value is -1.
+ *
+ */
+ssize_t process_packet(int conn, char *buffer, size_t n) {
+    struct request request = {
+        .method = NULL, .uri = NULL, .payload = NULL, .payload_length = -1};
+    ssize_t bytes_processed = parse_request(buffer, n, &request);
+
+    if (bytes_processed > 0) {
+        send_reply(conn, &request);
+
+        // Check the "Connection" header in the request to determine if the
+        // connection should be kept alive or closed.
+        const string connection_header = get_header(&request, "Connection");
+        if (connection_header && strcmp(connection_header, "close")) {
+            return -1;
+        }
+    } else if (bytes_processed == -1) {
+        // If the request is malformed or an error occurs during processing,
+        // send a 400 Bad Request response to the client.
+        const string bad_request = "HTTP/1.1 400 Bad Request\r\n\r\n";
+        send(conn, bad_request, strlen(bad_request), 0);
+        printf("Received malformed request, terminating connection.\n");
+        close(conn);
+        return -1;
+    }
+
+    return bytes_processed;
+}
+
+/**
+ * Sets up the connection state for a new socket connection.
+ *
+ * @param state A pointer to the connection_state structure to be initialized.
+ * @param sock The socket descriptor representing the new connection.
+ *
+ */
+static void connection_setup(struct connection_state *state, int sock) {
+    // Set the socket descriptor for the new connection in the connection_state
+    // structure.
+    state->sock = sock;
+
+    // Set the 'end' pointer of the state to the beginning of the buffer.
+    state->end = state->buffer;
+
+    // Clear the buffer by filling it with zeros to avoid any stale data.
+    memset(state->buffer, 0, HTTP_MAX_SIZE);
+}
+
+/**
+ * Discards the front of a buffer
+ *
+ * @param buffer A pointer to the buffer to be modified.
+ * @param discard The number of bytes to drop from the front of the buffer.
+ * @param keep The number of bytes that should be kept after the discarded
+ * bytes.
+ *
+ * @return Returns a pointer to the first unused byte in the buffer after the
+ * discard.
+ * @example buffer_discard(ABCDEF0000, 4, 2):
+ *          ABCDEF0000 ->  EFCDEF0000 -> EF00000000, returns pointer to first 0.
+ */
+char *buffer_discard(char *buffer, size_t discard, size_t keep) {
+    memmove(buffer, buffer + discard, keep);
+    memset(buffer + keep, 0, discard); // invalidate buffer
+    return buffer + keep;
+}
+
+/**
+ * Handles incoming connections and processes data received over the socket.
+ *
+ * @param state A pointer to the connection_state structure containing the
+ * connection state.
+ * @return Returns true if the connection and data processing were successful,
+ * false otherwise. If an error occurs while receiving data from the socket, the
+ * function exits the program.
+ */
+bool handle_connection(struct connection_state *state) {
+    // Calculate the pointer to the end of the buffer to avoid buffer overflow
+    const char *buffer_end = state->buffer + HTTP_MAX_SIZE;
+
+    // Check if an error occurred while receiving data from the socket
+    ssize_t bytes_read =
+        recv(state->sock, state->end, buffer_end - state->end, 0);
+    if (bytes_read == -1) {
+        perror("recv");
+        close(state->sock);
+        exit(EXIT_FAILURE);
+    } else if (bytes_read == 0) {
+        return false;
+    }
+
+    char *window_start = state->buffer;
+    char *window_end = state->end + bytes_read;
+
+    ssize_t bytes_processed = 0;
+    while ((bytes_processed = process_packet(state->sock, window_start,
+                                             window_end - window_start)) > 0) {
+        window_start += bytes_processed;
+    }
+    if (bytes_processed == -1) {
+        return false;
+    }
+
+    state->end = buffer_discard(state->buffer, window_start - state->buffer,
+                                window_end - window_start);
+    return true;
+}
+
+/**
+ * Derives a sockaddr_in structure from the provided host and port information.
+ *
+ * @param host The host (IP address or hostname) to be resolved into a network
+ * address.
+ * @param port The port number to be converted into network byte order.
+ *
+ * @return A sockaddr_in structure representing the network address derived from
+ * the host and port.
+ */
+static struct sockaddr_in derive_sockaddr(const char *host, const char *port) {
+    struct addrinfo hints = {
+        .ai_family = AF_INET,
+    };
+    struct addrinfo *result_info;
+
+    // Resolve the host (IP address or hostname) into a list of possible
+    // addresses.
+    int returncode = getaddrinfo(host, port, &hints, &result_info);
+    if (returncode) {
+        fprintf(stderr, "Error parsing host/port");
+        exit(EXIT_FAILURE);
+    }
+
+    // Copy the sockaddr_in structure from the first address in the list
+    struct sockaddr_in result = *((struct sockaddr_in *)result_info->ai_addr);
+
+    // Free the allocated memory for the result_info
+    freeaddrinfo(result_info);
+    return result;
+}
+
+/**
+ * Sets up a TCP server socket and binds it to the provided sockaddr_in address.
+ *
+ * @param addr The sockaddr_in structure representing the IP address and port of
+ * the server.
+ *
+ * @return The file descriptor of the created TCP server socket.
+ */
+static int setup_server_socket(struct sockaddr_in addr) {
+    const int enable = 1;
+    const int backlog = 1;
+
+    // Create a socket
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == -1) {
+        perror("socket");
+        exit(EXIT_FAILURE);
+    }
+
+    // Avoid dead lock on connections that are dropped after poll returns but
+    // before accept is called
+    if (fcntl(sock, F_SETFL, O_NONBLOCK) == -1) {
+        perror("fcntl");
+        exit(EXIT_FAILURE);
+    }
+
+    // Set the SO_REUSEADDR socket option to allow reuse of local addresses
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) ==
+        -1) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+
+    // Bind socket to the provided address
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
+        perror("bind");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
+    // Start listening on the socket with maximum backlog of 1 pending
+    // connection
+    if (listen(sock, backlog)) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    return sock;
+}
+
+/**
+ *  The program expects 3; otherwise, it returns EXIT_FAILURE.
+ *
+ *  Call as:
+ *
+ *  ./build/webserver self.ip self.port
+ */
+int main(int argc, char **argv) {
     if (argc != 3) {
-        fprintf(stderr, "Usage: webserver <IP> <Port>\n");
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    const char *ip = argv[1];
-    const char *port = argv[2];
+    struct sockaddr_in addr = derive_sockaddr(argv[1], argv[2]);
 
-    printf("start");
+    // Set up a server socket.
+    int server_socket = setup_server_socket(addr);
 
-    // neuen socket erstellen
-    int listen_sock;                                    // unser usb-port/unsere Tür die horcht
-    struct addrinfo hints;                              // set IP-type, socket-type, unsere IP-adresse
-    struct addrinfo *listen_sock_info;                  // hier werden infos über listen_sock gespeichert
+    // Create an array of pollfd structures to monitor sockets.
+    struct pollfd sockets[2] = {
+        {.fd = server_socket, .events = POLLIN},
+    };
 
-    memset(&hints, 0, sizeof hints );          // clear hints sodass kein unsinn drin gespeichert ist
-    hints.ai_family = AF_UNSPEC;                        // IPv4 oder IPv6 egal
-    hints.ai_socktype = SOCK_STREAM;                    // TCP socket
-    hints.ai_flags = AI_PASSIVE;                        // ?
+    struct connection_state state = {0};
+    while (true) {
 
-    // automatisches ausfüllen der infos für user listening socket
-    listen_sock = getaddrinfo(ip, port, &hints, &listen_sock_info);
-    if(listen_sock != 0) {                              // error-checking for getaddrinfo
-        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(listen_sock));
-        exit(1);
-    }
+        // Use poll() to wait for events on the monitored sockets.
+        int ready = poll(sockets, sizeof(sockets) / sizeof(sockets[0]), -1);
+        if (ready == -1) {
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
 
-    listen_sock = socket(listen_sock_info->ai_family, listen_sock_info->ai_socktype, listen_sock_info->ai_protocol);
-    if(listen_sock == -1) { error("server: socket"); } // error-checking
-
-    int set_option = 1; // against bind: address already in use error
-    int n = setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&set_option, sizeof(set_option));
-    if(n != 0) { error("server: setsockopt"); }         //error checking
-
-    // bind our IP address to listen_sock
-    int bin = bind(listen_sock, listen_sock_info->ai_addr, listen_sock_info->ai_addrlen);
-    if(bin == -1){error("sever: bind");}                // error-checking
-
-    freeaddrinfo(listen_sock_info);
-
-    // listen for someone that wants to connect
-    int lis = listen(listen_sock, QUEUE);
-    if(lis == -1){error("server: listen");}
-
-    // variables needed for accept()
-    struct sockaddr_in client_addr;
-    socklen_t cli_addr_len;
-    cli_addr_len = sizeof client_addr;
-
-    // the socket used to connect to someone else and buffer for recv()
-    int connect_sock;
-    char buffer[BUF_MAXLEN];
-
-    init_speicher(); // initialize speicher
-
-    // while listening (unending loop)
-    while(1) {
-        //accept connection request
-        connect_sock = accept(listen_sock, (struct sockaddr *) &client_addr, &cli_addr_len);
-        if (connect_sock == -1) {error("server: accept");}
-        memset(buffer, 0, BUF_MAXLEN);
-
-        // when connection is established
-        char *ptr = buffer;
-        long rec;
-        // as long as something is received (the connection is not closed and no error occurs)
-        while((rec = recv(connect_sock, ptr, BUF_MAXLEN, 0)) > 0) {
-            char *mes = NULL;
-            mes = strstr(buffer, "\r\n\r\n"); // search for double crlf in received message
-            ptr += rec; // update the ptr in the buffer so that next received messages don't overwrite already receives messages
-            if(mes == NULL) {   // if no double crlf is found, begin loop at start (wait for further content)
+        // Process events on the monitored sockets.
+        for (size_t i = 0; i < sizeof(sockets) / sizeof(sockets[0]); i += 1) {
+            if (sockets[i].revents != POLLIN) {
+                // If there are no POLLIN events on the socket, continue to the
+                // next iteration.
                 continue;
             }
+            int s = sockets[i].fd;
 
-            // save complete package in packet
-            long m_len = (mes+2) - buffer;
-            char packet[m_len+1];
-            memset(packet, 0, m_len+1);
-            strncpy(packet, buffer, m_len);
+            if (s == server_socket) {
 
-            // if packet is payload of previous package
-            if(is_package > 0) {
-                do_payload(packet);
-                // reset variables for next use
-                saved_where = -1;
-                is_package = 0;
-            }
-            // parse received packet and return appropriate message to sent back to client
-            else{
-                char *msg = parse_packet(packet); // parse the packet and return entsprechenden string
+                // If the event is on the server_socket, accept a new connection
+                // from a client.
+                int connection = accept(server_socket, NULL, NULL);
+                if (connection == -1 && errno != EAGAIN &&
+                    errno != EWOULDBLOCK) {
+                    close(server_socket);
+                    perror("accept");
+                    exit(EXIT_FAILURE);
+                } else {
+                    connection_setup(&state, connection);
 
-                // unvollständige Anfrage (nicht: Folge von nicht-leeren CRLF-separierten Zeilen)
-                if(msg == NULL) {
-                    close(connect_sock);
-                    continue;
+                    // limit to one connection at a time
+                    sockets[0].events = 0;
+                    sockets[1].fd = connection;
+                    sockets[1].events = POLLIN;
                 }
-                unsigned len = strlen(msg);
-                if (send(connect_sock, msg, len, 0) == -1) {
-                    error("server: send");
+            } else {
+                assert(s == state.sock);
+
+                // Call the 'handle_connection' function to process the incoming
+                // data on the socket.
+                bool cont = handle_connection(&state);
+                if (!cont) { // get ready for a new connection
+                    sockets[0].events = POLLIN;
+                    sockets[1].fd = -1;
+                    sockets[1].events = 0;
                 }
             }
-
-            // if received message was only one in buffer continue loop in next instance
-            if(strlen(mes+4) == 0){
-                memset(buffer, 0, BUF_MAXLEN); // clear buffer for next message
-                ptr = buffer;
-                continue;
-            }
-
-            // if not, save content after double crlf
-            char rest[strlen(mes+4)];
-            strncpy(rest, mes+4, strlen(mes+4));
-
-            memset(buffer, 0, BUF_MAXLEN); // clear buffer for next message
-            strncpy(buffer, rest, strlen(rest)); // save start of next packet at start of buffer
-            ptr = buffer;
-            ptr += (strlen(buffer)); // and update the ptr, so that start of next packet doesn't get overwritten
-        }
-
-        if (rec == -1) {                        //error checking
-            error("server: recv");
-        }
-
-        // if client closes connection
-        if (rec == 0) {
-            close(connect_sock);                    // close socket
-            continue;
         }
     }
+
+    return EXIT_SUCCESS;
 }
